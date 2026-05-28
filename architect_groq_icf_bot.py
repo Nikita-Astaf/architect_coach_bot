@@ -25,13 +25,13 @@ MY_PHONE = "+7-909-836-6123"        # ← например: "+7-999-123-4567"
 MY_YOOMONEY = "4100117646720635"     # ← например: "4100116602490366"
 
 # 4. Цена подписки на 1 месяц (в рублях)
-PRICE_MONTH = 100
+PRICE_MONTH = 990
 
 # 5. Цена подписки на 3 месяца (в рублях)
-PRICE_3MONTH = 290
+PRICE_3MONTH = 2490
 
 # 6. Сколько дней бесплатного пробного периода
-TRIAL_DAYS = 30
+TRIAL_DAYS = 3
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              БОЛЬШЕ НИЧЕГО МЕНЯТЬ НЕ НУЖНО                  ║
@@ -566,6 +566,61 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка голосовых сообщений через Groq Whisper."""
+    user_id = update.effective_user.id
+
+    if not is_allowed(user_id):
+        await update.message.reply_text(
+            "Доступ закончился. Выбери подписку:",
+            reply_markup=payment_keyboard()
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    try:
+        # Скачиваем голосовое сообщение
+        voice = update.message.voice or update.message.audio
+        file = await context.bot.get_file(voice.file_id)
+
+        with tempfile.NamedTemporaryFile(suffix='.ogg', delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+
+        # Транскрибируем через Groq Whisper
+        with open(tmp_path, 'rb') as audio_file:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(tmp_path, audio_file.read()),
+                model="whisper-large-v3",
+                language="ru",
+                response_format="text"
+            )
+
+        text = transcription.strip() if isinstance(transcription, str) else transcription.text.strip()
+
+        if not text:
+            await update.message.reply_text(
+                "Не смог разобрать голосовое. Попробуй ещё раз или напиши текстом."
+            )
+            return
+
+        # Показываем что расслышали
+        await update.message.reply_text(f"_{text}_", parse_mode="Markdown")
+
+        # Передаём в коуча как обычный текст
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        reply = ask_groq(user_id, text)
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logger.error(f"Voice error: {e}")
+        await update.message.reply_text(
+            "Не смог обработать голосовое. Попробуй написать текстом."
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -754,6 +809,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("users", users_list))
     app.add_handler(CallbackQueryHandler(handle_payment_callback))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -764,4 +821,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
