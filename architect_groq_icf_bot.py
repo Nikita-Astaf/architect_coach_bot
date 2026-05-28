@@ -3,7 +3,7 @@
 Персональный ИИ-коуч. Полностью бесплатно.
 
 Установка:
-  pip install python-telegram-bot groq
+  pip install python-telegram-bot groq pypdf2
 
 Переменные окружения (задать в Railway):
   TELEGRAM_TOKEN  — токен от @BotFather
@@ -40,6 +40,8 @@ TRIAL_DAYS = 30
 import os
 import json
 import logging
+import base64
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -198,7 +200,6 @@ SYSTEM_PROMPT = """Ты — Архитектор. Профессиональны
 
 ━━━ ГОЛОС ━━━
 Русский язык. Тихий, тёплый, точный. Короткие фразы.
-Используй слова клиента для диалога с ним.
 Никогда не начинай с «Конечно!», «Отлично!», «Я понимаю».
 В режиме поддержки: ещё тише, ещё теплее, без вопросов про смыслы.
 В режиме сессии: точнее, глубже, один вопрос за раз."""
@@ -411,6 +412,160 @@ async def handle_payment_callback(update: Update, context: ContextTypes.DEFAULT_
         )
 
 
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фотографий — анализ через Groq Vision."""
+    user_id = update.effective_user.id
+
+    if not is_allowed(user_id):
+        await update.message.reply_text(
+            "Доступ закончился. Выбери подписку:",
+            reply_markup=payment_keyboard()
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+
+    # Скачиваем фото
+    photo = update.message.photo[-1]  # берём наибольшее разрешение
+    file = await context.bot.get_file(photo.file_id)
+
+    with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
+        await file.download_to_drive(tmp.name)
+        with open(tmp.name, 'rb') as f:
+            image_data = base64.b64encode(f.read()).decode('utf-8')
+
+    caption = update.message.caption or ""
+    user_text = f"[Клиент прислал изображение{': ' + caption if caption else ''}]"
+
+    try:
+        # Groq Vision — llama-4-scout поддерживает изображения
+        add_to_history(user_id, "user", user_text)
+        history = get_history(user_id)
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        # Добавляем историю без последнего (его заменим с картинкой)
+        messages += history[:-1]
+        # Последнее сообщение — с картинкой
+        messages.append({
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{image_data}"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": caption if caption else "Клиент прислал изображение. Ответь в духе Архитектора — задай один вопрос об этом образе, используй технику зеркала."
+                }
+            ]
+        })
+
+        response = groq_client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=messages,
+            temperature=0.85,
+            max_tokens=600,
+        )
+        reply = response.choices[0].message.content
+        add_to_history(user_id, "assistant", reply)
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logger.error(f"Vision error: {e}")
+        # Fallback — если Vision не работает, отвечаем без картинки
+        try:
+            fallback_text = caption if caption else "Клиент прислал изображение без подписи."
+            reply = ask_groq(user_id, f"[Клиент прислал изображение. {fallback_text}] Ответь в духе Архитектора — спроси что клиент хотел показать этим образом.")
+            await update.message.reply_text(reply)
+        except Exception as e2:
+            logger.error(f"Fallback error: {e2}")
+            await update.message.reply_text("Вижу, что ты прислал изображение. Расскажи — что на нём и что это для тебя значит?")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка PDF и текстовых файлов."""
+    user_id = update.effective_user.id
+
+    if not is_allowed(user_id):
+        await update.message.reply_text(
+            "Доступ закончился. Выбери подписку:",
+            reply_markup=payment_keyboard()
+        )
+        return
+
+    doc = update.message.document
+    if not doc:
+        return
+
+    file_name = doc.file_name or ""
+    mime = doc.mime_type or ""
+
+    # Только PDF и текстовые файлы
+    if not (file_name.endswith('.pdf') or 'pdf' in mime or
+            file_name.endswith('.txt') or 'text' in mime):
+        await update.message.reply_text(
+            "Я пока умею читать PDF и текстовые файлы. "
+            "Пришли документ в одном из этих форматов."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    await update.message.reply_text("Читаю документ...")
+
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            await file.download_to_drive(tmp.name)
+            tmp_path = tmp.name
+
+        extracted_text = ""
+
+        if file_name.endswith('.pdf') or 'pdf' in mime:
+            try:
+                import PyPDF2
+                with open(tmp_path, 'rb') as f:
+                    reader = PyPDF2.PdfReader(f)
+                    for page in reader.pages[:10]:  # максимум 10 страниц
+                        extracted_text += page.extract_text() + "\n"
+            except ImportError:
+                await update.message.reply_text(
+                    "Не могу прочитать PDF — библиотека не установлена. "
+                    "Попробуй скопировать текст и прислать напрямую."
+                )
+                return
+        else:
+            with open(tmp_path, 'r', encoding='utf-8', errors='ignore') as f:
+                extracted_text = f.read()
+
+        if not extracted_text.strip():
+            await update.message.reply_text(
+                "Не смог извлечь текст из документа. "
+                "Возможно, это сканированный PDF. "
+                "Попробуй скопировать текст и прислать напрямую."
+            )
+            return
+
+        # Обрезаем если очень длинный
+        if len(extracted_text) > 3000:
+            extracted_text = extracted_text[:3000] + "...\n[текст обрезан]"
+
+        caption = update.message.caption or ""
+        prompt = f"Клиент прислал документ{': ' + caption if caption else ''}.\n\nСодержимое:\n{extracted_text}\n\nОтветь в духе Архитектора — задай один глубокий вопрос о том, что в этом документе важно для клиента."
+
+        reply = ask_groq(user_id, prompt)
+        await update.message.reply_text(reply)
+
+    except Exception as e:
+        logger.error(f"Document error: {e}")
+        await update.message.reply_text(
+            "Не смог прочитать документ. "
+            "Попробуй скопировать текст и прислать напрямую."
+        )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
 
@@ -599,6 +754,8 @@ def main():
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("users", users_list))
     app.add_handler(CallbackQueryHandler(handle_payment_callback))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Архитектор на Groq запущен ✦")
@@ -607,3 +764,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
