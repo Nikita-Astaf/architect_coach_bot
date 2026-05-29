@@ -22,16 +22,16 @@ MY_USERNAME = "nikita_astafyev"        # ← например: "ivan_ivanov"
 MY_PHONE = "+7-909-836-6123"        # ← например: "+7-999-123-4567"
 
 # 3. Кошелёк ЮMoney (или оставь пустым: "")
-MY_YOOMONEY = "4100117646720635"     # ← например: "4100116602490366"
+MY_YOOMONEY = "4100117646720635"    # ← например: "4100116602490366"
 
 # 4. Цена подписки на 1 месяц (в рублях)
-PRICE_MONTH = 990
+PRICE_MONTH = 100
 
 # 5. Цена подписки на 3 месяца (в рублях)
-PRICE_3MONTH = 2490
+PRICE_3MONTH = 290
 
 # 6. Сколько дней бесплатного пробного периода
-TRIAL_DAYS = 3
+TRIAL_DAYS = 30
 
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              БОЛЬШЕ НИЧЕГО МЕНЯТЬ НЕ НУЖНО                  ║
@@ -42,6 +42,7 @@ import json
 import logging
 import base64
 import tempfile
+import asyncio
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -485,6 +486,32 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Вижу, что ты прислал изображение. Расскажи — что на нём и что это для тебя значит?")
 
 
+
+async def send_voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Отправляет ответ голосовым сообщением через Edge TTS."""
+    try:
+        import edge_tts
+
+        # Голос — тёплый мужской русский
+        voice = "ru-RU-DmitryNeural"
+
+        with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+            tmp_path = tmp.name
+
+        communicate = edge_tts.Communicate(text, voice)
+        await communicate.save(tmp_path)
+
+        with open(tmp_path, 'rb') as audio:
+            await update.message.reply_voice(voice=audio)
+
+        os.unlink(tmp_path)
+        return True
+
+    except Exception as e:
+        logger.error(f"TTS error: {e}")
+        return False
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка PDF и текстовых файлов."""
     user_id = update.effective_user.id
@@ -639,7 +666,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         reply = ask_groq(user_id, user_text)
-        await update.message.reply_text(reply)
+
+        # Голосовой ответ только если клиент явно попросил
+        voice_triggers = [
+            "ответь голосом", "голосовой ответ", "скажи голосом",
+            "отвечай голосом", "хочу голос", "говори голосом",
+            "voice", "озвучь", "прочитай вслух"
+        ]
+        wants_voice = any(t in user_text.lower() for t in voice_triggers)
+
+        if wants_voice:
+            sent = await send_voice_reply(update, context, reply)
+            if not sent:
+                await update.message.reply_text(reply)
+        else:
+            await update.message.reply_text(reply)
+
     except Exception as e:
         logger.error(f"Groq error: {e}")
         reset_history(user_id)
