@@ -488,32 +488,55 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Отправляет ответ голосовым сообщением через gTTS."""
+    """Отправляет ответ голосовым сообщением через Edge TTS — естественный голос."""
     tmp_path = None
     try:
-        from gtts import gTTS
+        import edge_tts
+        import subprocess
 
-        # Разбиваем длинный текст на части если нужно
-        if len(text) > 500:
-            text = text[:500] + "..."
+        # Тёплый мужской русский голос Microsoft Neural
+        voice = "ru-RU-DmitryNeural"
+
+        if len(text) > 600:
+            text = text[:600] + "..."
 
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
             tmp_path = tmp.name
 
-        tts = gTTS(text=text, lang='ru', slow=False)
-        tts.save(tmp_path)
+        # Запускаем edge-tts через subprocess — надёжнее на Python 3.13
+        proc = await asyncio.create_subprocess_exec(
+            "edge-tts",
+            "--voice", voice,
+            "--text", text,
+            "--write-media", tmp_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        await proc.communicate()
 
-        with open(tmp_path, 'rb') as audio:
-            await update.message.reply_voice(voice=audio)
-
-        return True
+        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+            with open(tmp_path, 'rb') as audio:
+                await update.message.reply_voice(voice=audio)
+            return True
+        else:
+            raise Exception("Файл не создан")
 
     except Exception as e:
-        logger.error(f"TTS error: {e}")
-        await update.message.reply_text(
-            f"Не смог озвучить. Вот текстом:\n\n{text}"
-        )
-        return False
+        logger.error(f"Edge TTS error: {e}")
+        # Fallback на gTTS
+        try:
+            from gtts import gTTS
+            with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
+                tmp_path = tmp.name
+            tts = gTTS(text=text[:500], lang='ru', slow=False)
+            tts.save(tmp_path)
+            with open(tmp_path, 'rb') as audio:
+                await update.message.reply_voice(voice=audio)
+            return True
+        except Exception as e2:
+            logger.error(f"gTTS fallback error: {e2}")
+            await update.message.reply_text(f"Не смог озвучить. Вот текстом:\n\n{text}")
+            return False
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
