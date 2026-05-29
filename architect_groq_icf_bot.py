@@ -77,6 +77,112 @@ groq_client = Groq(api_key=GROQ_KEY)
 
 # ── Системный промпт ──────────────────────────────────────────────────────────
 
+SYSTEM_PROMPT = """Ты — Архитектор. Коуч по стандартам ICF. Равный партнёр, не эксперт.
+
+РЕЖИМЫ — определяй с первого сообщения:
+• ПОДДЕРЖКА: человек выговаривается → 2-3 фразы тепла, без вопросов про цели
+• ПЕРЕХОД: выдохнул, ищет выход → «Хочешь поисследовать это вместе?»
+• СЕССИЯ: есть запрос → полный коучинг ICF
+• КРИЗИС: отчаяние/безнадёжность → остановись, спроси о безопасности
+
+СЕССИЯ (ICF):
+Начало: «Что хочешь исследовать? Как поймёшь что сессия удалась?»
+Середина: слова → метафора → инсайт
+Конец: «Что забираешь? Мы достигли того, что хотел?»
+
+ЗЕРКАЛО — главный инструмент:
+Используй точные слова клиента. Не переформулируй.
+«Ты сказал [слово] — расскажи больше.»
+«Ты уже второй раз говоришь [слово] — что за ним?»
+«[слово] — как это выглядит? Что вокруг тебя?»
+
+ВОПРОСЫ (один за раз):
+«Что для тебя значит...» / «Что ты замечаешь?» / «Где в теле это чувствуешь?»
+«Кем был бы без этой истории?» / «Это факт или интерпретация?»
+«Что самое маленькое действие было бы значимым?»
+«И что ты теперь знаешь?»
+
+ЗАПРЕТЫ: никаких советов · никаких оценок · не интерпретируй за клиента · не два вопроса сразу
+
+ГОЛОС: русский · тихий · тёплый · короткие фразы
+Начинай с: «Ты говоришь...» / «Я слышу...» / «Звучит так, будто...»
+Никогда: «Конечно!» / «Отлично!» / «Молодец»"""И-коуч. Полностью бесплатно.
+
+Установка:
+  pip install python-telegram-bot groq pypdf2
+
+Переменные окружения (задать в Railway):
+  TELEGRAM_TOKEN  — токен от @BotFather
+  GROQ_KEY        — ключ от console.groq.com
+  ADMIN_IDS       — твой Telegram ID (узнать у @userinfobot)
+"""
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║           ВСЁ ЧТО НУЖНО ЗАМЕНИТЬ — ТОЛЬКО ЗДЕСЬ            ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+# 1. Твой Telegram username (без @)
+MY_USERNAME = "ВАШ_USERNAME"        # ← например: "ivan_ivanov"
+
+# 2. Номер телефона для оплаты через СБП
+MY_PHONE = "+7-XXX-XXX-XXXX"        # ← например: "+7-999-123-4567"
+
+# 3. Кошелёк ЮMoney (или оставь пустым: "")
+MY_YOOMONEY = "4100XXXXXXXXXXX"     # ← например: "4100116602490366"
+
+# 4. Цена подписки на 1 месяц (в рублях)
+PRICE_MONTH = 990
+
+# 5. Цена подписки на 3 месяца (в рублях)
+PRICE_3MONTH = 2490
+
+# 6. Сколько дней бесплатного пробного периода
+TRIAL_DAYS = 3
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║              БОЛЬШЕ НИЧЕГО МЕНЯТЬ НЕ НУЖНО                  ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+import os
+import json
+import logging
+import base64
+import tempfile
+import asyncio
+from datetime import datetime, timedelta
+from pathlib import Path
+
+from groq import Groq
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes
+)
+
+logging.basicConfig(
+    format="%(asctime)s — %(levelname)s — %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# ── Конфигурация ──────────────────────────────────────────────────────────────
+
+TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+GROQ_KEY       = os.environ["GROQ_KEY"]
+
+ADMIN_IDS = set(
+    int(x.strip())
+    for x in os.environ.get("ADMIN_IDS", "").split(",")
+    if x.strip().isdigit()
+)
+
+
+DB_FILE = Path("users.json")
+
+groq_client = Groq(api_key=GROQ_KEY)
+
+# ── Системный промпт ──────────────────────────────────────────────────────────
+
 SYSTEM_PROMPT = """Ты — Архитектор. Профессиональный коуч по стандартам ICF 2025.
 Ты равный партнёр — идёшь рядом, пока человек сам находит путь.
 Твоя сила — в качестве присутствия и умении читать, что нужно человеку прямо сейчас.
@@ -289,16 +395,33 @@ def ask_groq(user_id: int, user_message: str | None) -> str:
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     messages += get_history(user_id)
 
-    response = groq_client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=messages,
-        temperature=0.85,
-        max_tokens=600,
-    )
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=messages,
+            temperature=0.85,
+            max_tokens=500,
+        )
+        reply = response.choices[0].message.content
+        add_to_history(user_id, "assistant", reply)
+        return reply
 
-    reply = response.choices[0].message.content
-    add_to_history(user_id, "assistant", reply)
-    return reply
+    except Exception as e:
+        err = str(e)
+        if "429" in err or "rate_limit" in err:
+            # Извлекаем время ожидания если есть
+            import re
+            match = re.search(r"try again in (\d+)m", err)
+            if match:
+                minutes = int(match.group(1)) + 1
+                raise RateLimitError(f"Я временно достиг лимита запросов — это случается при активном использовании. Пожалуйста, напиши мне через {minutes} минут — я буду здесь и мы продолжим с того места где остановились. 🙏")
+            else:
+                raise RateLimitError("Я временно достиг лимита запросов. Напиши мне через 30 минут — продолжим. 🙏")
+        raise
+
+
+class RateLimitError(Exception):
+    pass
 
 # ── Клавиатура оплаты ─────────────────────────────────────────────────────────
 
@@ -715,6 +838,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(reply)
         else:
             await update.message.reply_text(reply)
+
+    except RateLimitError as e:
+        # Не сбрасываем историю — клиент сможет продолжить позже
+        await update.message.reply_text(str(e))
 
     except Exception as e:
         logger.error(f"Groq error: {e}")
