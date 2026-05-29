@@ -86,7 +86,7 @@ SYSTEM_PROMPT = """Ты — Архитектор. Коуч по стандарт
 • КРИЗИС: отчаяние/безнадёжность → остановись, спроси о безопасности
 
 СЕССИЯ (ICF):
-Начало: «Что хочешь исследовать? Как поймёшь что сессия удалась?»
+Начало: обратись по имени (если знаешь) → «Как ты себя чувствуешь прямо сейчас?» → потом «Что хочешь исследовать?»
 Середина: слова → метафора → инсайт
 Конец: «Что забираешь? Мы достигли того, что хотел?»
 
@@ -464,18 +464,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+    first_name = update.effective_user.first_name or ""
+    left = days_left(user_id)
+    is_trial = not user.get("paid_until") and user.get("trial_until")
 
-    try:
-        greeting = ask_groq(user_id, None)
-        left = days_left(user_id)
-        is_trial = not user.get("paid_until") and user.get("trial_until")
-        if is_trial and left <= 1:
-            greeting += f"\n\n_— Пробный период заканчивается через {left} дн. /subscribe_"
-        await update.message.reply_text(greeting, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Groq error on start: {e}")
-        await update.message.reply_text("Рад, что ты здесь.\n\nЧто сейчас живёт внутри тебя?")
+    greeting = (
+        f"Привет, {first_name}! Рад тебя видеть. Как ты себя чувствуешь?"
+        if first_name else
+        "Привет! Рад тебя видеть. Как ты себя чувствуешь?"
+    )
+
+    if is_trial and left <= 1:
+        greeting += f"\n\n_— Пробный период заканчивается через {left} дн. /subscribe_"
+
+    add_to_history(user_id, "assistant", greeting)
+    await update.message.reply_text(greeting)
 
 
 async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -484,7 +487,9 @@ async def new_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Доступ закончился.", reply_markup=payment_keyboard())
         return
     reset_history(user_id)
-    await update.message.reply_text("Хорошо. Начнём заново.\n\nЧто сейчас живёт внутри тебя?")
+    first_name = update.effective_user.first_name or ""
+    name_str = f", {first_name}" if first_name else ""
+    await update.message.reply_text(f"Хорошо{name_str}, начнём заново.\n\nКак ты себя чувствуешь прямо сейчас?")
 
 
 async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
