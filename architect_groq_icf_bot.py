@@ -488,28 +488,39 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def send_voice_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Отправляет ответ голосовым сообщением через Edge TTS."""
+    """Отправляет ответ голосовым сообщением через gTTS."""
+    tmp_path = None
     try:
-        import edge_tts
+        from gtts import gTTS
 
-        # Голос — тёплый мужской русский
-        voice = "ru-RU-DmitryNeural"
+        # Разбиваем длинный текст на части если нужно
+        if len(text) > 500:
+            text = text[:500] + "..."
 
         with tempfile.NamedTemporaryFile(suffix='.mp3', delete=False) as tmp:
             tmp_path = tmp.name
 
-        communicate = edge_tts.Communicate(text, voice)
-        await communicate.save(tmp_path)
+        tts = gTTS(text=text, lang='ru', slow=False)
+        tts.save(tmp_path)
 
         with open(tmp_path, 'rb') as audio:
             await update.message.reply_voice(voice=audio)
 
-        os.unlink(tmp_path)
         return True
 
     except Exception as e:
         logger.error(f"TTS error: {e}")
+        await update.message.reply_text(
+            f"Не смог озвучить. Вот текстом:\n\n{text}"
+        )
         return False
+
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
