@@ -47,6 +47,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from groq import Groq
+import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -74,6 +75,10 @@ ADMIN_IDS = set(
 DB_FILE = Path("users.json")
 
 groq_client = Groq(api_key=GROQ_KEY)
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
 
 # ── Системный промпт ──────────────────────────────────────────────────────────
 
@@ -146,44 +151,6 @@ TRIAL_DAYS = 3
 # ╔══════════════════════════════════════════════════════════════╗
 # ║              БОЛЬШЕ НИЧЕГО МЕНЯТЬ НЕ НУЖНО                  ║
 # ╚══════════════════════════════════════════════════════════════╝
-
-import os
-import json
-import logging
-import base64
-import tempfile
-import asyncio
-from datetime import datetime, timedelta
-from pathlib import Path
-
-from groq import Groq
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler,
-    CallbackQueryHandler, filters, ContextTypes
-)
-
-logging.basicConfig(
-    format="%(asctime)s — %(levelname)s — %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# ── Конфигурация ──────────────────────────────────────────────────────────────
-
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GROQ_KEY       = os.environ["GROQ_KEY"]
-
-ADMIN_IDS = set(
-    int(x.strip())
-    for x in os.environ.get("ADMIN_IDS", "").split(",")
-    if x.strip().isdigit()
-)
-
-
-DB_FILE = Path("users.json")
-
-groq_client = Groq(api_key=GROQ_KEY)
 
 # ── Системный промпт ──────────────────────────────────────────────────────────
 
@@ -390,42 +357,101 @@ def add_to_history(user_id: int, role: str, content: str):
 def reset_history(user_id: int):
     user_histories[user_id] = []
 
-# ── Groq API ──────────────────────────────────────────────────────────────────
+# ── Ошибки и API модели ───────────────────────────────────────────────────────
+
+class RateLimitError(Exception):
+    pass
 
 def ask_groq(user_id: int, user_message: str | None) -> str:
     if user_message:
         add_to_history(user_id, "user", user_message)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += get_history(user_id)
+    # Проверка на твой личный ADMIN ID для подключения скрытого контекста
+    is_admin_user = user_id in ADMIN_IDS
+    
+    if is_admin_user:
+        # Личный контекст для Никиты — глубокая проработка целей и ограничений
+        custom_system_prompt = (
+            SYSTEM_PROMPT + 
+            "\n\nСлужебный контекст: Ты общаешься со своим создателем (Никита, 34 года, "
+            "исполнительный директор в производстве премиальной мебели, текущий доход 250к, "
+            "цель — выйти на 1 000 000 руб/мес). Помогай ему как профессиональный ментор, "
+            "подсвечивай внутренние конфликты между потребностью в простоте и финансовыми "
+            "амбициями. Будь острее, задавай глубокие вопросы без фальши."
+        )
+    else:
+        custom_system_prompt = SYSTEM_PROMPT
 
+    history_msgs = get_history(user_id)
+
+    # --- СТУПЕНЬ 1: Gemini 1.5 Pro ---
+    if GEMINI_API_KEY:
+        try:
+            gemini_messages = []
+            for m in history_msgs:
+                gemini_messages.append({
+                    "role": "user" if m["role"] == "user" else "model",
+                    "parts": [m["content"]]
+                })
+            
+            model_pro = genai.GenerativeModel(
+                model_name="gemini-1.5-pro",
+                system_instruction=custom_system_prompt,
+                generation_config={"temperature": 0.85, "max_output_tokens": 500}
+            )
+            
+            response = model_pro.generate_content(gemini_messages)
+            reply = response.text
+            add_to_history(user_id, "assistant", reply)
+            return reply
+            
+        except Exception as e:
+            logger.warning(f"Ступень 1 (Gemini 1.5 Pro) исчерпана или недоступна: {e}. Переключаюсь на Ступень 2.")
+
+    # --- СТУПЕНЬ 2: Llama 3.3 70B via Groq ---
     try:
+        groq_messages = [{"role": "system", "content": custom_system_prompt}] + history_msgs
         response = groq_client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=messages,
+            messages=groq_messages,
             temperature=0.85,
             max_tokens=500,
         )
         reply = response.choices[0].message.content
         add_to_history(user_id, "assistant", reply)
         return reply
-
+        
     except Exception as e:
         err = str(e)
-        if "429" in err or "rate_limit" in err:
-            # Извлекаем время ожидания если есть
-            import re
-            match = re.search(r"try again in (\d+)m", err)
-            if match:
-                minutes = int(match.group(1)) + 1
-                raise RateLimitError(f"Я временно достиг лимита запросов — это случается при активном использовании. Пожалуйста, напиши мне через {minutes} минут — я буду здесь и мы продолжим с того места где остановились. 🙏")
-            else:
-                raise RateLimitError("Я временно достиг лимита запросов. Напиши мне через 30 минут — продолжим. 🙏")
-        raise
+        logger.warning(f"Ступень 2 (Groq Llama) недоступна: {err}. Переключаюсь на резервную Ступень 3.")
 
+    # --- СТУПЕНЬ 3: Gemini 1.5 Flash (Безлимитный щит) ---
+    if GEMINI_API_KEY:
+        try:
+            gemini_messages = []
+            for m in history_msgs:
+                gemini_messages.append({
+                    "role": "user" if m["role"] == "user" else "model",
+                    "parts": [m["content"]]
+                })
+                
+            model_flash = genai.GenerativeModel(
+                model_name="gemini-1.5-flash",
+                system_instruction=custom_system_prompt,
+                generation_config={"temperature": 0.85, "max_output_tokens": 500}
+            )
+            
+            response = model_flash.generate_content(gemini_messages)
+            reply = response.text
+            add_to_history(user_id, "assistant", reply)
+            return reply
+            
+        except Exception as e:
+            logger.error(f"Все ступени каскада моделей упали: {e}")
+            raise RateLimitError("Все наши каналы связи сейчас перегружены. Давай сделаем паузу на 15-20 минут, я передохну и мы продолжим. 🙏")
+    else:
+        raise RateLimitError("Временные технические ограничения на стороне серверов. Зайди, пожалуйста, через 20 минут. 🙏")
 
-class RateLimitError(Exception):
-    pass
 
 # ── Клавиатура оплаты ─────────────────────────────────────────────────────────
 
